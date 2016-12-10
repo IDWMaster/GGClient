@@ -21,6 +21,10 @@ public:
 
 int main(int argc, char** argv)
 {
+  
+  //TODO: New hole punching method: UDP/ICMP hole punching (ICMP packets are usually routed through NATs)
+  
+  
   std::cout<<"GlobalGrid Protocol Client"<<std::endl;
   std::cout<<"Reference Implementation. Not intended for production use."<<std::endl;
   
@@ -51,7 +55,7 @@ int main(int argc, char** argv)
   IPEndpoint localEP;
   socket->GetLocalEndpoint(localEP);
   std::cout<<"Server running on port "<<localEP.port<<std::endl;
-  size_t buffsz = 1024*8;
+  size_t buffsz = 1024*1024*5;
   unsigned char* buff_alloc = (unsigned char*)aligned_alloc(16,16+buffsz);
   unsigned char* buffer = buff_alloc+15;
   if(((size_t)buffer+1) % 16) {
@@ -105,10 +109,20 @@ int main(int argc, char** argv)
 	secure_random_bytes(session.challenge,sizeof(session.challenge));
 	sessions[claimedThumbprint] = session;
 	printf("Got connection request from entity claiming to be %s\n",guid_str);
-	//Verify claim
-	buffer[1] = 0;
-	memcpy(buffer+2,session.challenge,sizeof(session.challenge));
-	aes_cbc_encrypt(session.key,(int64_t*)(buffer+1),1+sizeof(session.challenge));
+	void* auth = DB_FindAuthority(guid_str);
+	if(!auth) {
+	  //Send request for key
+	  socket->Send(buffer,1,cb.receivedFrom);
+	}else {
+	  std::shared_ptr<Buffer> buffy = RSA_Encrypt(auth,(unsigned char*)session.challenge,sizeof(session.challenge));
+	  RSA_Free(auth);
+	  uint16_t len = buffy->len;
+	  memcpy(buffer+2,&len,sizeof(len));
+	  memcpy(buffer+2+2,buffy->data,buffy->len);
+	  size_t align = crypt_align(16,1+2+buffy->len);
+	  aes_cbc_encrypt(session.key,(int64_t*)buffer+1,align);
+	  socket->Send(session.key,align+1,cb.receivedFrom);
+	}
 	
       }
 	break;
@@ -119,6 +133,31 @@ int main(int argc, char** argv)
 	  return;
 	}
 	Session session = sessions[claimedThumbprint];
+	aes_cbc_decrypt(session.key,buffer+1,cb.outlen-1);
+	unsigned char opcode;
+	stream.Increment(1);
+	stream.Read(opcode);
+	switch(opcode) {
+	  case 0:
+	  {
+	    //Challenge to duel
+	    uint16_t len;
+	    stream.Read(len);
+	    std::shared_ptr<Buffer> buffy = RSA_Decrypt(privkey,stream.Increment(len),len);
+	    if(!buffy) {
+	      return;
+	    }
+	    if(buffy->len) {
+	      //Challenge accepted!
+	      size_t align = crypt_align(16,buffy->len);
+	      memcpy(buffer+2,buffy->data,buffy->len);
+	      buffer[1] = 1;
+	      aes_cbc_encrypt(session.key,(int64_t*)(buffer+1),align);
+	      socket->Send(buffer,align+2,cb.receivedFrom);
+	    }
+	  }
+	    break;
+	}
 	
       }
 	break;

@@ -58,6 +58,12 @@ static inline void aes_cbc_encrypt(const void* key, int64_t* data, size_t len) {
 }
 
 
+static inline size_t crypt_align(size_t align,size_t size) {
+  if(size % align) {
+    return size+(align - (size % align));
+  }
+  return size;
+}
 
 
 
