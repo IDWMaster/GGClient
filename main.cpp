@@ -3,7 +3,6 @@
 #include "crypto.h"
 #include <iostream>
 #include "cppext/cppext.h"
-#include <uuid/uuid.h>
 #include <map>
 #include "database.h"
 
@@ -13,7 +12,7 @@ using namespace GlobalGrid;
 
 class Session {
 public:
-  uint64_t key[2];
+  uint64_t key[4];
   uint64_t challenge[2];
   bool verified;
   
@@ -48,7 +47,7 @@ int main(int argc, char** argv)
   }
   Guid localguid;
   RSA_thumbprint(privkey,(unsigned char*)localguid.value);
-  uuid_unparse((unsigned char*)localguid.value,guid_str);
+  ToHexString((unsigned char*)localguid.value,sizeof(localguid.value),guid_str);
   std::cout<<"Your ID is "<<guid_str<<std::endl;
   
   std::shared_ptr<UDPSocket> socket = CreateUDPSocket();
@@ -62,12 +61,16 @@ int main(int argc, char** argv)
     printf("Alignment fault %i\n",(int)(((size_t)buffer+1) % 16));
     abort();
   }
+  *((Guid*)(buffer+1)) = localguid;
+  
+  
   std::map<Guid,Session> sessions;
   auto bot = sessions.begin();
   
   auto sendHandshake = [&](const IPEndpoint& nextHop, const Guid& address){
+    *((Guid*)(buffer+1)) = localguid;
     char guid_str[256];
-    uuid_unparse((unsigned char*)address.value,guid_str);
+    ToHexString((unsigned char*)address.value,sizeof(address.value),guid_str);
     void* key = DB_FindAuthority(guid_str);
     buffer[0] = 0;
     Session session;
@@ -75,19 +78,24 @@ int main(int argc, char** argv)
     session.verified = true;
     sessions[address] = session;
     std::shared_ptr<Buffer> buffy = RSA_Encrypt(key,(unsigned char*)session.key,sizeof(session.key));
-    socket->Send(buffy->data,buffy->len,nextHop);
+    memcpy(buffer+1+16,buffy->data,buffy->len);
+    socket->Send(buffer,buffy->len+1+16,nextHop);
   };
-  
-  socket->Receive(buffer,buffsz,F2UDPCB([&](const UDPCallback& cb){
+  std::shared_ptr<UDPCallback> recvcb = F2UDPCB([&](const UDPCallback& cb){
     try {
+      printf("received packet of length %i\n",(int)cb.outlen);
     BStream stream(buffer,cb.outlen);
+    unsigned char opcode;
+    stream.Read(opcode);
     Guid claimedThumbprint;
     stream.Read(claimedThumbprint.value);
     
    char guid_str[256];
-    uuid_unparse((unsigned char*)claimedThumbprint.value,guid_str);
-    unsigned char opcode;
-    stream.Read(opcode);
+    ToHexString((unsigned char*)claimedThumbprint.value,sizeof(claimedThumbprint.value),guid_str);
+    
+    printf("Received packet (opcode %i) from person claiming to be %s\n",(int)opcode,(char*)guid_str);
+  *((Guid*)(buffer+1)) = localguid;
+    
     switch(opcode) {
       case 0:
       {
@@ -95,16 +103,21 @@ int main(int argc, char** argv)
 	std::shared_ptr<Buffer> key = RSA_Decrypt(privkey,stream.ptr,stream.length);
 	if(!key) {
 	  //Unable to decrypt data.
+	  printf("Error: Private key decrypt failure.");
 	  return;
 	}
 	if(key->len<32) {
 	  //Handshake -- bad key length
+	  printf("Error. Bad key length.\n");
 	  return;
 	}
 	//Buffers are guaranteed to be aligned on a 16-byte boundary.
 	Session session;
 	session.key[0] = ((uint64_t*)key->data)[0];
 	session.key[1] = ((uint64_t*)key->data)[1];
+	session.key[2] = ((uint64_t*)key->data)[2];
+	session.key[3] = ((uint64_t*)key->data)[3];
+	
 	session.verified = false;
 	secure_random_bytes(session.challenge,sizeof(session.challenge));
 	sessions[claimedThumbprint] = session;
@@ -112,16 +125,20 @@ int main(int argc, char** argv)
 	void* auth = DB_FindAuthority(guid_str);
 	if(!auth) {
 	  //Send request for key
-	  socket->Send(buffer,1,cb.receivedFrom);
+	  *buffer = 2;
+	  socket->Send(buffer,1+16,cb.receivedFrom);
 	}else {
+	  //Send a challenge
 	  std::shared_ptr<Buffer> buffy = RSA_Encrypt(auth,(unsigned char*)session.challenge,sizeof(session.challenge));
 	  RSA_Free(auth);
 	  uint16_t len = buffy->len;
-	  memcpy(buffer+2,&len,sizeof(len));
-	  memcpy(buffer+2+2,buffy->data,buffy->len);
+	  *buffer = 1;
+	  *(buffer+1+16) = 0;
+	  memcpy(buffer+1+16+1,&len,sizeof(len));
+	  memcpy(buffer+1+16+1+2,buffy->data,buffy->len);
 	  size_t align = crypt_align(16,1+2+buffy->len);
-	  aes_cbc_encrypt(session.key,(int64_t*)buffer+1,align);
-	  socket->Send(session.key,align+1,cb.receivedFrom);
+	  aes_cbc_encrypt(session.key,(int64_t*)(buffer+1+16),align);
+	  socket->Send(buffer,1+16+align,cb.receivedFrom);
 	}
 	
       }
@@ -130,13 +147,18 @@ int main(int argc, char** argv)
       {
 	//Encrypted packet
 	if(sessions.find(claimedThumbprint) == sessions.end()) {
-	  return;
+	  break;
 	}
 	Session session = sessions[claimedThumbprint];
-	aes_cbc_decrypt(session.key,buffer+1,cb.outlen-1);
+	size_t enclen = stream.length;
+	int64_t* encrypted = (int64_t*)(stream.Increment(enclen));
+	aes_cbc_decrypt(session.key,encrypted,enclen);
+	
+	stream.ptr-=enclen;
+	stream.length+=enclen;
 	unsigned char opcode;
-	stream.Increment(1);
 	stream.Read(opcode);
+	printf("Encrypted substream, OPCODE %i\n",(int)opcode);
 	switch(opcode) {
 	  case 0:
 	  {
@@ -145,16 +167,32 @@ int main(int argc, char** argv)
 	    stream.Read(len);
 	    std::shared_ptr<Buffer> buffy = RSA_Decrypt(privkey,stream.Increment(len),len);
 	    if(!buffy) {
-	      return;
+	      break;
 	    }
+	    printf("Challenge size = %i\n",(int)buffy->len);
 	    if(buffy->len) {
 	      //Challenge accepted!
-	      size_t align = crypt_align(16,buffy->len);
-	      memcpy(buffer+2,buffy->data,buffy->len);
-	      buffer[1] = 1;
-	      aes_cbc_encrypt(session.key,(int64_t*)(buffer+1),align);
-	      socket->Send(buffer,align+2,cb.receivedFrom);
+	      size_t align = crypt_align(16,buffy->len+1);
+	      buffer[1+16] = 1;
+	      memcpy(buffer+1+16+1,buffy->data,buffy->len);
+	      aes_cbc_encrypt(session.key,(int64_t*)(buffer+1+16),align);
+	      socket->Send(buffer,align+1+16,cb.receivedFrom);
 	    }
+	  }
+	    break;
+	  case 1:
+	  {
+	    //Challenge response
+	    Session session;
+	    if(stream.length<sizeof(session.challenge)) {
+	      printf("Illegal size\n");
+	      return;
+	    }
+	    if(memcmp(session.challenge,stream.ptr,sizeof(session.challenge))) {
+	      printf("Challenge mismatch\n");
+	      break;
+	    }
+	    printf("Identity verified\n");
 	  }
 	    break;
 	}
@@ -166,28 +204,32 @@ int main(int argc, char** argv)
 	//Request for public key
 	std::shared_ptr<Buffer> buffy = RSA_Export(privkey,false);
 	buffer[0] = 3;
-	memcpy(buffer+1,buffy->data,buffy->len);
-	socket->Send(buffer,buffy->len+1,cb.receivedFrom);
+	memcpy(buffer+1+16,buffy->data,buffy->len);
+	socket->Send(buffer,buffy->len+1+16,cb.receivedFrom);
 	
       }
 	break;
       case 3:
       {
 	//Received public key
-	void* key = RSA_Key(buffer,cb.outlen);
+	void* key = RSA_Key(stream.ptr,stream.length);
 	if(key) {
 	  
 	  RSA_thumbprint(key,guid_str);
-	  
+	  Guid ian;
+	  RSA_thumbprint(key,(unsigned char*)ian.value);
+	  RSA_Free(key);
+	  if(ian != claimedThumbprint) {
+	    printf("Error. Possible (D)DoS attempt detected.\n");
+	  }
 	  void* auth = DB_FindAuthority(guid_str);
 	  if(auth) {
 	    RSA_Free(auth);
 	  }else {
-	    DB_Insert_Certificate(guid_str,buffer,cb.outlen,false);
+	    DB_Insert_Certificate(guid_str,stream.ptr,stream.length,false);
 	  }
 	  //Send connect request
-	  Guid ian;
-	  RSA_thumbprint(key,(unsigned char*)ian.value);
+	  
 	  sendHandshake(cb.receivedFrom,ian);
 	}
       }
@@ -198,6 +240,18 @@ int main(int argc, char** argv)
     }catch(const char* er) {
       
     }
-  }));
+    socket->Receive(buffer,buffsz,recvcb);
+  });
+  socket->Receive(buffer,buffsz,recvcb);
+  
+  if(argc>1) {
+    //connect to remote endpoint via IP address
+    *buffer = 2;
+    IPEndpoint dest;
+    dest.ip = argv[1];
+    dest.port = atoi(argv[2]);
+    socket->Send(buffer,1+16,dest);
+  }
+  
   System::Enter();
 }

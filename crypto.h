@@ -37,7 +37,7 @@ static inline void xorblock(int64_t* dest, int64_t* src) {
 ///@param len The number of bytes to decrypt
 static inline void aes_cbc_decrypt(const void* key, int64_t* data, size_t len) {
   len/=8;
-  for(size_t i = len-1;i>0;i-=2) {
+  for(size_t i = len-2;i>0;i-=2) {
     aes_decrypt(key,data+i);
     xorblock(data+i,data+i-2);
   }
