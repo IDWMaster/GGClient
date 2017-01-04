@@ -5,6 +5,15 @@
 #include "cppext/cppext.h"
 #include <map>
 #include "database.h"
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <net/if.h>
+#include <linux/if_tun.h>
+#include <sys/fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/if_ether.h>
+#include <linux/ipv6.h>
 
 using namespace System;
 using namespace System::Net;
@@ -251,6 +260,61 @@ int main(int argc, char** argv)
     dest.ip = argv[1];
     dest.port = atoi(argv[2]);
     socket->Send(buffer,1+16,dest);
+  }
+  
+  int kernelfd = open("/dev/net/tun",O_RDWR);
+  
+  struct ifreq request;
+  memset(&request,0,sizeof(request));
+  request.ifr_flags = IFF_TAP;
+  strcpy(request.ifr_name,"globalgrid0");
+  if(ioctl(kernelfd,TUNSETIFF,(void*)&request)) {
+    printf("Unable to start kernel-mode network driver. Please ensure that you're running this as root.\n");
+    return -1;
+  }
+  
+  unsigned char adapter_mac[6];
+  ioctl(kernelfd,SIOCGIFHWADDR,(void*)&request);
+  memcpy(adapter_mac,request.ifr_hwaddr.sa_data,6);
+  ioctl(kernelfd,TUNGETIFF,&request);
+  
+  
+  
+  char adapter_hex[256];
+  ToHexString(adapter_mac,6,adapter_hex);
+  printf("Virtual network adapter %s\n",adapter_hex);
+  
+  std::shared_ptr<System::IO::Stream> netif = System::IO::FD2S(kernelfd);
+  size_t iobuffsz = 1024*1024*5;
+  unsigned char* iobuf = new unsigned char[iobuffsz];
+  std::shared_ptr<System::IO::IOCallback> readcb = System::IO::IOCB([&](System::IO::IOCallback& data){
+    BStream str(iobuf+4,data.outlen);
+    struct ethhdr phy_header;
+    str.Read(phy_header);
+    ToHexString(phy_header.h_source,6,adapter_hex);
+    if(memcmp(phy_header.h_source,adapter_mac,6)) {
+      printf("WARNING: Dropped packet from %s. Promiscuous mode is not supported on this interface type.\n",adapter_hex);
+      
+    }
+    netif->Read(iobuf,iobuffsz,readcb);
+  });
+  int sockfd = ::socket(AF_INET6, SOCK_DGRAM, 0);
+  
+  netif->Read(iobuf,iobuffsz,readcb);
+  request.ifr_flags = IFF_UP;
+  ioctl(sockfd,SIOCSIFFLAGS,&request);
+  
+  
+  in6_addr i6addr;
+  memcpy(&i6addr,localguid.value,16);
+  struct in6_ifreq addrreq;
+  addrreq.ifr6_addr = i6addr;
+  addrreq.ifr6_ifindex = if_nametoindex("globalgrid0");
+  addrreq.ifr6_prefixlen = 0; //0 bits for prefix length. GlobalGrid will attempt to route to ALL IPv6 addresses. This is the most secure setting; however, it may conflict with native IPv6 routing on
+  //a local machine. Hopefully the kernel is smart enough to handle routing with two devices advertising the same address.....
+  if(ioctl(sockfd,SIOCSIFADDR,&addrreq)) {
+    printf("Failed to set virtual address on socket at index %i, errno = %i.\n",(int)request.ifr_ifindex,errno);
+    return -1;
   }
   
   System::Enter();
